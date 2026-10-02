@@ -20,6 +20,11 @@ function hasOuterTag(text, name){
   return !!tag && new RegExp('</?'+tag+'\\s*>').test(String(text));
 }
 
+// 日志那一块要拼 HTML，文案一律走这里转义，别把正文里的尖括号当成标签。
+function esc(value){
+  return String(value==null?'':value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 function scenes(text, tag = DEFAULT_SCENE_TAG) {
   if (typeof text !== 'string') throw Error('消息不是文本。');
   // tag 为正文范围标签名（不带尖括号）。留空 = 不圈范围，整条回复都算正文。
@@ -126,12 +131,25 @@ function translated(text, blocks, tag) {
   return values;
 }
 // 纠正模式多返回一份「改了哪里」的清单；复用同一份 JSON 解析，不额外发请求。
+// 解析失败时这里是**静默返回空数组**，作者看不出「模型没给」和「给了但解不出」的区别，所以另开一个判读函数。
 function correctionNotes(text){
   try{
     const data=JSON.parse(text.trim().replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/,'$1'));
     if(!Array.isArray(data?.corrections))return [];
     return data.corrections.map(x=>typeof x==='string'?{where:x,reason:''}:{where:String(x?.where??'').slice(0,80),reason:String(x?.reason??'').slice(0,200)}).filter(x=>x.where||x.reason).slice(0,12);
   }catch(_){return [];}
+}
+// 只判读、不改行为：给运行日志写清「为什么一条都没解出来」，别让它变成静默跳过。
+function 纠错解不出原因(text){
+  const 文=String(text??'').trim();
+  if(!文)return '模型返回了空回复';
+  let data;
+  try{data=JSON.parse(文.replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/,'$1'));}
+  catch(_){return '返回的不是合法 JSON（'+文.length+' 字，开头：'+文.slice(0,80).replace(/\s+/g,' ')+'）';}
+  if(data===null||typeof data!=='object')return '返回的 JSON 不是对象';
+  if(data.corrections===undefined)return '返回的 JSON 里没有 corrections 字段（顶层字段：'+Object.keys(data).slice(0,8).join('、')+'）';
+  if(!Array.isArray(data.corrections))return 'corrections 不是数组，而是 '+typeof data.corrections;
+  return '';
 }
 // ---------- 「本次改动」：用 where 当锚点在改前 / 改后两份正文里定位 ----------
 // 逐字比较两份正文，给出一张「原文位置 → 改后位置」的对照表（只登记两边一样的字），
@@ -385,21 +403,28 @@ function transferProtected(target,reference,current,tags) {
   // 命中的条目摊平成原来那种形状（条目自带 world / uid / comment / content）。
   function wbRow(e){return {source:'世界书 '+String(e?.world||'未知'),title:String(e?.comment||e?.name||'').trim()||('条目 '+String(e?.uid??'')),content:String(e?.content??'').trim()};}
   async function worldbookBasis(){
+    // 世界书没命中时最难查，所以这一趟走的是哪条路、走到哪一步断的，都记在 运行诊断.wb 上。
+    const wb=运行诊断.wb={mode:'',scanned:0,hit:0,error:''};
     const scanner=await worldInfoScanner();
     const entries=activations=>(typeof activations?.values==='function')?Array.from(activations.values()):Array.from(activations||[]);
     if(typeof scanner?.checkWorldInfo==='function'){
-      const scan=scanLines();if(!scan.length)return [];
-      let result;try{result=await scanner.checkWorldInfo(scan,WI_HUGE_CONTEXT,true,cardScanData(cardFields()));}catch(_){return [];}
+      wb.mode='酒馆蓝绿灯';
+      const scan=scanLines();wb.scanned=scan.length;
+      if(!scan.length)return [];
+      let result;try{result=await scanner.checkWorldInfo(scan,WI_HUGE_CONTEXT,true,cardScanData(cardFields()));}catch(e){wb.mode='扫描失败';wb.error=String(e?.message||e);return [];}
       const hit=result?.allActivatedEntries;
-      if(hit)return entries(hit).map(wbRow).filter(x=>x.content);
+      if(hit){const rows=entries(hit).map(wbRow).filter(x=>x.content);wb.hit=rows.length;return rows;}
+      wb.mode='扫描没给结果';
     }
     // 老酒馆里没有 checkWorldInfo：退回按启用名单逐本读，并把名字补进 source。
-    const c=ctx();if(typeof c.loadWorldInfo!=='function')return [];
+    const c=ctx();if(typeof c.loadWorldInfo!=='function'){wb.mode=wb.mode||'没有可用的读取接口';return [];}
+    wb.mode='按启用名单逐本读';
     const out=[];
     for(const name of worldbookNames()){
       let raw;try{raw=await c.loadWorldInfo(name);}catch(_){continue;}
       for(const e of worldbookEntries(raw))out.push({...wbRow(e),source:'世界书 '+name});
     }
+    wb.hit=out.length;
     return out;
   }
   function worldbookEntries(raw){
@@ -438,11 +463,51 @@ function transferProtected(target,reference,current,tags) {
   function basisSizes(basis){
     return (basis||[]).map(b=>b.label+' '+b.text.length+' 字').join('；');
   }
+  /* 纠错结果：模型给了几条 corrections；一条都没解出来时把原因写清楚
+     （空回复 / 解不出 JSON / 结构不对），别让它变成一个「看起来没改动」的静默跳过。 */
+  function 记纠错日志(内容,清单){
+    try{
+      const 条=Array.isArray(清单)?清单.length:0;
+      if(条){记日志('信息','纠错','模型给出 '+条+' 条改动'+(条>=12?'（已按上限截到 12 条）':'')+'：'+清单.slice(0,3).map(x=>String(x.where||'').slice(0,20)).filter(Boolean).join(' / '));return;}
+      const 因=纠错解不出原因(内容);
+      if(因)记日志('警告','纠错','一条改动都没解出来：'+因);
+      else 记日志('信息','纠错','模型返回了空的 corrections（这一轮确实没有要改的地方）');
+    }catch(_){}
+  }
+  /* 依据组装记三条：角色卡多少字、世界书命中几条（没命中就写清走到哪一步断的）、
+     最近几楼取到几条——哪一块是空的，一眼能看出来。 */
+  function 记依据日志(basis,message){
+    try{
+      const 找=名=>(basis||[]).find(b=>String(b.label||'').indexOf(名)>=0);
+      const 卡=找('角色卡'),书=找('世界书'),楼=找('最近几楼'),补=找('用户补充');
+      const 卡字=卡?String(卡.text).length:0;
+      记日志('信息','依据','角色卡 '+(卡?(卡字+' 字'+(卡.text.includes('因长度上限被截断')?'（截断）':'')):'没有可读的设定'));
+      const wb=运行诊断.wb||{};
+      if(书)记日志('信息','依据','世界书命中 '+(wb.hit||0)+' 条 · '+String(书.text).length+' 字 · '+(wb.mode||'读取成功'));
+      else 记日志('信息','依据','世界书没有条目进依据 · '+(wb.mode||'未知')+(wb.error?'：'+wb.error:'')+(wb.scanned!==undefined?'（扫描 '+wb.scanned+' 楼）':''));
+      const 几楼=楼?(Array.isArray(楼.text)?楼.text.length:0):0;
+      const 待纠=message?String(message.mes||'').length:0;
+      记日志('信息','依据','最近几楼 '+(几楼?(几楼+' 楼 · '+(Array.isArray(楼.text)?楼.text.reduce((n,x)=>n+String(x.text||'').length,0):0)+' 字'):'一条都没有')
+        +' · 待纠正正文 '+待纠+' 字'+(补?' · 用户补充要求 '+String(补.text).length+' 字':''));
+    }catch(_){}
+  }
 
   const host=window.parent,doc=host.document,ID='__tutuPolish';
   if(host[ID]){host[ID].open();return;}
+  // 运行日志：出问题时一键复制、粘进聊天就能发出来的那份证据。
+  // 只留最近这些条——手机上没人读长的，而且它跟设置一起写进扩展设置，不能无限涨。
+  const TUTU_VERSION='1.4.0';
+  const RUNLOG_LIMIT=300;
+  const RUNLOG_LEVELS=['信息','警告','错误'];
+  // 落盘节流：攒够 RUNLOG_FLUSH_COUNT 条、或距上次落盘满 RUNLOG_FLUSH_MS 毫秒，写一次。
+  // 一次处理能连着记十几条，每条都 persist() 会把整份设置（含备份正文）序列化十几遍，手机上明细卡顿。
+  // 攒着不丢：日志是给人看的证据，晚几百毫秒落盘不影响排查；复制、清空、重画之前都强制落一次。
+  const RUNLOG_FLUSH_COUNT=10;
+  const RUNLOG_FLUSH_MS=1000;
   const STORE='tutu_polish_v1';// 保存位置：SillyTavern.getContext().extensionSettings[STORE]
   const KEY_STORE='tutu_polish_key_v1';
+  // 运行时诊断：世界书那一趟走到哪一步、纠错结果为什么解不出，挂在这个对象上，不写进存档。
+  const 运行诊断={};
   const originalFetch=host.fetch;
   const ctx=()=>host.SillyTavern.getContext();
   // mode 只认「润色 / 纠正」；target 仍是润色提示词里那行目标语言。
@@ -474,12 +539,161 @@ function transferProtected(target,reference,current,tags) {
   const opOf=m=>MODE_LABEL[m]||MODE_LABEL.polish;
   const templateLabel=t=>(MODE_LABEL[t.mode]||'润色')+' · '+(t.name||'未命名提示词').replace(/^(润色|纠正)\s*[·・]\s*/,'');
   let backups=Array.isArray(saved.backups)?saved.backups:(saved.backup?[saved.backup]:[]);
+  // 运行日志跟着扩展设置一起存（换聊天也还在，出问题的那一轮不会因为切聊天丢掉）。
+  // 条数上限在记日志那一处截；老存档里字段不对就当空的重来。
+  let runLog=Array.isArray(saved.runLog)?saved.runLog.filter(x=>x&&typeof x.文==='string').slice(0,RUNLOG_LIMIT):[];
   if(!Number.isInteger(config.timeoutSeconds)||config.timeoutSeconds<30||config.timeoutSeconds>1800)config.timeoutSeconds=300;
   let enabled=false,secret='',run=null,blocked=false,waiters=[],generation=null,disposed=false,writing=false,debug=null,testRun=null,pendingStart=null;
   // 「本次改动」跟着最近一次纠正的结果留在内存里（只给当前这次看，不写进存档）。清掉即失效。
   let changes=null,openChange=-1,changesExpanded=false;
   let outgoing=null,records=[],lastAction=null;
   const redactions=new Set();
+
+  /* ---------- 运行日志 ---------- */
+  // 密钥脱敏第一道：固定形状的（Bearer 头、sk- 开头的密钥、URL 里带 token 的查询参数）。
+  function 抹形状(文){
+    return String(文==null?'':文)
+      .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi,'Bearer [REDACTED]')
+      .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi,'[REDACTED_API_KEY]')
+      .replace(/([?&](?:api[_-]?key|apikey|token|access[_-]?token|auth|key|secret|password)=)[^&\s"'#]*/gi,'$1[REDACTED]')
+      .slice(0,2400);
+  }
+  // 密钥脱敏第二道（最重要）：作者用的是中转接口，密钥格式不可预测，固定形状认不出来。
+  // 所以把「当前密钥 / 存过的密钥 / 接口地址里的用户名密码」当字面量整个扫一遍替换掉。
+  // 接口地址本身不整条抹掉，否则日志里看不出连的是哪家；地址里的 token 由上面的查询参数规则抹。
+  function 去密钥(文){
+    let 话=抹形状(文);
+    const 候选=[secret];
+    try{for(const x of redactions)候选.push(x);}catch(_){}
+    for(const x of 候选){
+      const 钥=String(x==null?'':x).trim();
+      if(钥.length<6||话.indexOf(钥)<0)continue;
+      话=话.split(钥).join('[REDACTED_API_KEY]');
+    }
+    try{
+      const 址=String(config.base||'').trim();
+      const m=/^([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/i.exec(址);
+      if(m)话=话.split(m[2]).join('[REDACTED]');
+    }catch(_){}
+    return 话;
+  }
+  // 落盘节流用的三个状态，只活在这一次页面里，不写进设置。
+  let 日志待落条数=0,日志落盘表=null,日志落盘中=false;
+  // 已知的解析失败原因（纠错结果那一类用）。
+  /* 落盘。强制时立刻写；否则由记日志按条数或时间叫它。     落盘中不再重入：persist() 出错会走 console.warn，挡住就不会自己转起来。
+     这里不复用 saveConfig()：那是「用户点保存接口」的校验入口，token 填错会抛错，日志不该被它拦住。 */
+  function 日志落盘(强制){
+    if(日志落盘中)return;
+    if(!强制&&!日志待落条数)return;
+    if(日志落盘表!==null){try{host.clearTimeout(日志落盘表);}catch(_){}日志落盘表=null;}
+    日志待落条数=0;日志落盘中=true;
+    try{persist();}catch(e){try{console.warn('[tutu] 运行日志落盘失败：',e);}catch(_){}}
+    日志落盘中=false;
+  }
+  /* 记日志的唯一入口：入栈、截断、节流落盘都在这儿，别在别处自己 push。
+     级不认识的当「信息」；密钥在落栈前抹掉；一次只留一句话，长的截到 200 字。 */
+  function 记日志(级,源,文){
+    try{
+      const 话=去密钥(typeof 文==='function'?文():文).replace(/\s+/g,' ').trim().slice(0,200);
+      if(!话)return;
+      runLog.unshift({t:Date.now(),级:RUNLOG_LEVELS.includes(级)?级:'信息',源:String(源==null?'':源).replace(/\s+/g,' ').trim().slice(0,12)||'系统',文:话});
+      if(runLog.length>RUNLOG_LIMIT)runLog.length=RUNLOG_LIMIT;   // 新的在前，从尾部丢最旧的
+      if(日志落盘中)return;
+      日志待落条数++;
+      if(日志待落条数>=RUNLOG_FLUSH_COUNT){日志落盘(false);return;}
+      if(日志落盘表===null)日志落盘表=host.setTimeout(()=>{日志落盘表=null;日志落盘(false);},RUNLOG_FLUSH_MS);
+    }catch(_){}
+  }
+  // 一段耗时的短写法：日志里要能看出「哪一次、多久、成没成」。
+  const 毫秒文=ms=>ms>=1000?(Math.round(ms/100)/10)+' 秒':Math.round(ms)+' 毫秒';
+  const 两=纳秒=>(纳秒<10?'0':'')+纳秒;
+  function 相对时间(毫秒){
+    const 秒=Math.max(0,Math.round((Date.now()-(Number(毫秒)||0))/1000));
+    if(秒<5)return '刚刚';
+    if(秒<60)return 秒+' 秒前';
+    const 分=Math.floor(秒/60);
+    if(分<60)return 分+' 分钟前';
+    const 时=Math.floor(分/60);
+    if(时<24)return 时+' 小时前';
+    return Math.floor(时/24)+' 天前';
+  }
+  /* 导出成纯文本。界面里用相对时间好读，导出用绝对时间——作者要拿它跟酒馆那边的时间、跟截图对上。
+     头部这两行也要过去密钥：地址本身就可能是「中转把令牌写在 URL 里」的那种。 */
+  function 导出运行日志(){
+    const d=new Date();
+    const 头='tutu 运行日志\n导出于 '+d.getFullYear()+'-'+两(d.getMonth()+1)+'-'+两(d.getDate())+' '+两(d.getHours())+':'+两(d.getMinutes())+'\n'
+      +'版本 '+TUTU_VERSION+'  条数 '+runLog.length+'/'+RUNLOG_LIMIT+'\n'
+      +'模型 '+去密钥(config.model||'未填')+'  地址 '+去密钥(config.base||'未填')+'\n\n';
+    return 头+runLog.map(条=>{
+      const t=new Date(Number(条&&条.t)||0);
+      return '['+((条&&条.级)||'信息')+'] '+两(t.getHours())+':'+两(t.getMinutes())+':'+两(t.getSeconds())
+        +' '+((条&&条.源)||'系统')+'：'+((条&&条.文)||'');
+    }).join('\n')+'\n';
+  }
+  function 日志行HTML(){
+    if(!runLog.length)return '<div class="mt-log-empty">还没有记录</div>';
+    return runLog.map(条=>{
+      const 级=RUNLOG_LEVELS.includes(条&&条.级)?条.级:'信息';
+      return '<div class="mt-log-row is-'+级+'">'
+        +'<span class="mt-log-lv">'+esc(级)+'</span>'
+        +'<span class="mt-log-time">'+esc(相对时间(条&&条.t))+'</span>'
+        +'<span class="mt-log-src">'+esc((条&&条.源)||'系统')+'</span>'
+        +'<span class="mt-log-text">'+esc((条&&条.文)||'')+'</span>'
+        +'</div>';
+    }).join('');
+  }
+  function 画日志(){
+    const 盒=el('log-list');if(!盒)return;
+    const 位=盒.scrollTop;
+    盒.innerHTML=日志行HTML();
+    盒.scrollTop=位;
+    const 计=el('log-count');if(计)计.textContent=runLog.length?runLog.length+' 条':'';
+  }
+  /* 复制。clipboard 必须在 click 处理器里当场调，不能放在 await 之后——
+     手机浏览器会把 await 之后的调用当成「不是用户手势」直接拒掉。 */
+  function 复制日志(){
+    日志落盘(true);
+    const 文=导出运行日志();
+    try{
+      if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+        const p=navigator.clipboard.writeText(文);
+        if(p&&typeof p.then==='function'){p.then(()=>say('日志已复制，粘到聊天里发出去就行。')).catch(()=>兜底复制日志(文));return;}
+        say('日志已复制，粘到聊天里发出去就行。');return;
+      }
+    }catch(_){}
+    兜底复制日志(文);
+  }
+  /* clipboard 不给用时的退路：写进那个平时藏着的输入框、选中、execCommand。
+     再不行就把它亮出来让作者长按全选——手机上这条路常常是唯一走得通的。 */
+  function 兜底复制日志(文){
+    try{
+      const ta=el('log-fallback');
+      if(!ta){say('复制失败，请长按日志手动选择。');return;}
+      ta.value=文;
+      if(ta.classList)ta.classList.add('is-on');
+      try{ta.focus();}catch(_){}
+      try{ta.select();ta.setSelectionRange(0,文.length);}catch(_){}
+      let 成=false;
+      try{成=doc.execCommand('copy')===true;}catch(_){成=false;}
+      say(成?'日志已复制，粘到聊天里发出去就行。':'已展开日志文本，长按全选复制。');
+    }catch(_){say('复制失败，请长按日志手动选择。');}
+  }
+  /* 清空要点两下，跟别处的删除一个规矩：第一下先变成「确认清空」，三秒不动自己复原。 */
+  function 清空日志(){
+    const btn=el('log-clear');if(!btn)return;
+    if(btn.getAttribute('data-armed')!=='1'){
+      btn.setAttribute('data-armed','1');
+      btn.textContent='确认清空';
+      host.setTimeout(()=>{
+        if(disposed||!btn.isConnected||btn.getAttribute('data-armed')!=='1')return;
+        btn.setAttribute('data-armed','0');btn.textContent='清空日志';
+      },3000);
+      return;
+    }
+    btn.setAttribute('data-armed','0');btn.textContent='清空日志';
+    runLog.length=0;
+    日志落盘(true);画日志();say('日志已清空。');
+  }
   const root=doc.createElement('div');root.id='tutu-polish';root.setAttribute('data-theme',config.theme);
   root.innerHTML=`<style>
 #tutu-polish{
@@ -617,6 +831,24 @@ color-scheme:light}
 #tutu-polish .mt-side ins{text-decoration:none;background:var(--mt-on-bg);color:var(--mt-text);box-shadow:inset 0 -1px 0 var(--mt-on-border);border-radius:3px;padding:0 2px}
 #tutu-polish .mt-faded{color:var(--mt-text-4)}
 #tutu-polish .mt-hit{background:var(--mt-fold-open);border-radius:3px;padding:0 2px}
+/* 运行日志：跟着 --mt-* 主题走，深浅两套都不用另写颜色。新的在最上面。 */
+#tutu-polish .mt-log-list{max-height:260px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--mt-border-4);border-radius:8px;padding:6px 8px;background:var(--mt-well);scrollbar-width:thin}
+#tutu-polish .mt-log-row{display:flex;gap:8px;align-items:baseline;font-size:12px;line-height:1.6;padding:2px 0;overflow-wrap:anywhere}
+#tutu-polish .mt-log-lv,#tutu-polish .mt-log-time,#tutu-polish .mt-log-src{flex:0 0 auto}
+#tutu-polish .mt-log-lv{font-weight:600;color:var(--mt-text-3)}
+#tutu-polish .mt-log-row.is-警告 .mt-log-lv{color:var(--mt-accent-mark)}
+#tutu-polish .mt-log-row.is-错误 .mt-log-lv{color:var(--mt-focus-2)}
+#tutu-polish .mt-log-time{color:var(--mt-text-4);min-width:52px}
+#tutu-polish .mt-log-src{color:var(--mt-title)}
+#tutu-polish .mt-log-text{flex:1 1 auto;min-width:0;color:var(--mt-text-2)}
+#tutu-polish .mt-log-empty{font-size:12px;color:var(--mt-text-4)}
+#tutu-polish .mt-log-head{display:flex;gap:8px;align-items:center;justify-content:space-between;margin:10px 0 6px}
+#tutu-polish .mt-log-count{font-size:12px;color:var(--mt-text-4)}
+#tutu-polish .mt-log-acts{display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;margin-top:8px}
+#tutu-polish .mt-log-acts button{margin:0}
+/* 复制兜底用的输入框，平时藏着；剪贴板被拒时才亮出来让作者长按全选。 */
+#tutu-polish .mt-log-fallback{display:none;min-height:120px;margin:8px 0 0;font-size:12px}
+#tutu-polish .mt-log-fallback.is-on{display:block}
 </style>
 <section hidden aria-label="tutu">
   <header class="mt-head"><div class="mt-heading"><strong>tutu</strong><button type="button" data-theme-toggle class="mt-compact" title="在深色与清爽浅色之间切换">浅色主题</button><button type="button" data-close class="mt-compact">收起面板</button></div><small data-card></small></header>
@@ -655,6 +887,12 @@ color-scheme:light}
     <div class="mt-group"><button type="button" class="mt-fold" data-debug aria-expanded="false" aria-controls="mt-debug">本次调试</button><div class="mt-pane" data-debug-pane id="mt-debug" data-expanded="false" inert><div class="mt-pane-inner"><div class="mt-pad">
       <small>只在当前页面显示，不包含授权头；内容可能含剧情，请自行决定是否分享。</small><p>处理 API：实际消息、返回与诊断</p><pre data-log></pre><p>主 API：最后正文换回原文</p><p data-outgoing-status></p><pre data-main-log></pre>
     </div></div></div></div>
+    <div class="mt-group"><button type="button" class="mt-fold" data-log aria-expanded="false" aria-controls="mt-log">运行日志</button><div class="mt-pane" data-log-pane id="mt-log" data-expanded="false" inert><div class="mt-pane-inner"><div class="mt-pad">
+      <div class="mt-log-head"><small>出问题时复制一份发出去，就能看出是哪一步不对。</small><span class="mt-log-count" data-log-count></span></div>
+      <div class="mt-log-list" data-log-list></div>
+      <div class="mt-log-acts"><button type="button" data-log-copy>复制日志</button><button type="button" data-log-clear>清空日志</button></div>
+      <textarea class="mt-log-fallback" data-log-fallback readonly aria-label="日志文本"></textarea>
+    </div></div></div></div>
     <small style="margin:12px 9px 4px">用于当前模式的请求，按角色保存。发送顺序：前置 → 当前模式要求与术语 → 正文 → 尾部。身份按所选 role 发送，不启用接口专属预填充；接口是否接受尾部助手消息取决于服务。</small>
   </div>
   <footer class="mt-footer"><p class="mt-hint">当前功能：<span data-mode-current>润色</span></p><div class="mt-mode-pair mt-mode-set"><div class="mt-mode"><button type="button" data-run-polish>润色</button></div><div class="mt-mode"><button type="button" data-run-correction>纠正</button></div></div><div class="mt-actions"><button type="button" data-process>润色／重做最后回复</button><button type="button" data-restore>查看原文</button></div><div class="mt-mode" data-next hidden><button type="button" data-next-polish>接着润色这一楼</button><small>正文 → 纠正 → 润色 是一条链：纠正只管把事说对，文风交给下一步。点这里直接对刚纠正过的这一楼做润色，用的还是你自己的润色提示词。</small></div><p data-status role="status" aria-live="polite"></p><div class="mt-changes" data-changes hidden><button type="button" class="mt-fold" data-changes-fold aria-expanded="false" aria-controls="mt-changes-list">本次改动</button><div class="mt-pane" data-changes-pane id="mt-changes-list" data-expanded="false" inert><div class="mt-pane-inner"><div class="mt-pad"><div class="mt-change-list" data-changes-list></div><div data-changes-detail></div></div></div></div></div></footer>
@@ -673,7 +911,7 @@ color-scheme:light}
   const cardKey=()=>{const c=ctx();return c.groupId?null:c.characters?.[c.characterId]?.avatar||null;};
   const scope=()=>JSON.stringify([cardKey(),ctx().chatId,ctx().groupId]);
   const prefs=()=>{const p={...defaults(),...(cards[cardKey()]||{})};p.mode=modeOf(p);const t=library.find(t=>t.id===p.selections?.[p.mode]&&t.mode===p.mode);if(t){p.target=t.data.target;p[p.mode==='polish'?'polishRules':'correctionRules']=t.data.rules;}return p;};
-  function persist(){const c=ctx();c.extensionSettings[STORE]={config,cards,backups,library};c.saveSettingsDebounced();}
+  function persist(){const c=ctx();c.extensionSettings[STORE]={config,cards,backups,library,runLog};c.saveSettingsDebounced();}
   function release(){blocked=false;waiters.splice(0).forEach(resolve=>resolve());paintActions();}
   function last(){const chat=ctx().chat;for(let i=chat.length-1;i>=0;i--)if(!chat[i].is_user&&!chat[i].is_system)return {id:i,message:chat[i]};return null;}
   function aiRows(){return ctx().chat.map((message,id)=>({message,id})).filter(x=>!x.message.is_user&&!x.message.is_system);}
@@ -882,29 +1120,37 @@ color-scheme:light}
   }
   function showDebug(){el('log').textContent=debug?debugText(debug):'还没有处理请求。';el('main-log').textContent=outgoing?redact(outgoing):'还没有处理主请求。';}
   function reportOutgoing(value){Object.assign(value,{time:value.time||new Date().toISOString(),chatMessageId:value.chatMessageId??generation?.target?.id,generationType:value.generationType||generation?.type||'normal'});outgoing=value;el('outgoing-status').textContent=value.status;say(value.status);showDebug();}
-  function loadKey(){try{const record=JSON.parse(host.localStorage.getItem(KEY_STORE)||'null');if(record&&record.base===apiRoot(config.base)&&typeof record.key==='string'){secret=record.key;redactions.add(secret);el('key').value=secret;el('remember').checked=true;}}catch(_){} }
+  function loadKey(){try{const record=JSON.parse(host.localStorage.getItem(KEY_STORE)||'null');if(record&&record.base===apiRoot(config.base)&&typeof record.key==='string'){secret=record.key;redactions.add(secret);el('key').value=secret;el('remember').checked=true;记日志('信息','启动','已读回浏览器记住的密钥');return;}}catch(_){}记日志('信息','启动','没有浏览器记住的密钥，本次要用的话得在接口配置里填');}
   function forgetKey(){host.localStorage.removeItem(KEY_STORE);}
 
-  function cancel(reason){if(run){run.controller.abort();run.cancelled=true;}say(reason);}
+  function cancel(reason){if(run){run.controller.abort();run.cancelled=true;记日志('警告','跳过',run.operation+'被取消：'+String(reason||'用户取消'));}say(reason);}
   function ensureCard(){if(!cardKey()||!ctx().chatId)throw Error('请先打开单人角色聊天。');}
-  async function call(messages,controller,maxTokens=config.maxTokens){
+  // 用途 = 润色 / 纠正 / 连接测试。每次调用都记一条「哪一次、多久、成没成、发出的额度、回来多少字、有没有被截断」。
+  async function call(messages,controller,maxTokens=config.maxTokens,用途='处理'){
     const base=apiRoot(config.base);if(!config.model.trim())throw Error('请填写模型名称并保存接口。');
-    let response;try{response=await host.fetch(base+'/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...(secret?{Authorization:'Bearer '+secret}:{})},body:JSON.stringify(translationBody(config,messages,maxTokens)),signal:controller.signal,credentials:'omit'});}catch(_){throw Error(controller.signal.aborted?'处理已取消或超时。':'无法连接处理服务：请检查地址、网络和服务的 CORS 跨域设置。');}
+    const 起=Date.now(),址=base+'/chat/completions';
+    let response;try{response=await host.fetch(址,{method:'POST',headers:{'Content-Type':'application/json',...(secret?{Authorization:'Bearer '+secret}:{})},body:JSON.stringify(translationBody(config,messages,maxTokens)),signal:controller.signal,credentials:'omit'});}
+    catch(e){const 取消=controller.signal.aborted;记日志('错误','接口',用途+(取消?'已取消或超时':'请求发出失败')+' · 连接 '+址+' · '+毫秒文(Date.now()-起)+' · '+(取消?'达到等待上限，已中断':'报错：'+String(e?.message||e).slice(0,200)));
+      throw Error(取消?'处理已取消或超时。':'无法连接处理服务：请检查地址、网络和服务的 CORS 跨域设置。');}
     let raw;
-    try{raw=await response.text();}catch(_){throw Error(controller.signal.aborted?'读取响应时已取消或超时。':'响应体读取失败，可能是连接中断。');}
-    if(controller.signal.aborted)throw Error('处理已取消或超时。');
+    try{raw=await response.text();}
+    catch(e){const 取消=controller.signal.aborted;
+      记日志('错误','接口',用途+(取消?'读响应时已中断':'读响应失败')+' · '+毫秒文(Date.now()-起)+' · '+String(e?.message||e).slice(0,200));
+      throw Error(取消?'读取响应时已取消或超时。':'响应体读取失败，可能是连接中断。');}
+    if(controller.signal.aborted){记日志('错误','接口',用途+'已取消或超时 · '+毫秒文(Date.now()-起)+' · 已等待到上限，未写回正文');throw Error('处理已取消或超时。');}
     const diagnostic={httpStatus:response.status,contentType:response.headers?.get('content-type')||'未提供',characters:raw.length,preview:(secret?raw.split(secret).join('[密钥已隐藏]'):raw).slice(0,2000)};
     if(run&&debug){debug.transport=diagnostic;showDebug();}
-    if(!response.ok)throw Error('处理服务 HTTP '+response.status+'，请查看本次调试中的 transport。');
-    let data;try{data=decodeResponse(raw);}catch(e){throw Error(e.message+'（HTTP '+response.status+'；'+diagnostic.contentType+'；'+raw.length+' 字符）');}
+    if(!response.ok){记日志('错误','接口',用途+'失败 · HTTP '+response.status+' · '+毫秒文(Date.now()-起)+' · 发出额度 '+maxTokens+' · 返回 '+raw.length+' 字 · '+String(raw).replace(/\s+/g,' ').slice(0,200));throw Error('处理服务 HTTP '+response.status+'，请查看本次调试中的 transport。');}
+    let data;try{data=decodeResponse(raw);}catch(e){记日志('错误','接口',用途+'响应解不出 · HTTP '+response.status+' · '+毫秒文(Date.now()-起)+' · 返回 '+raw.length+' 字 · '+String(e?.message||e).slice(0,200));throw Error(e.message+'（HTTP '+response.status+'；'+diagnostic.contentType+'；'+raw.length+' 字符）');}
     const choice=data?.choices?.[0],content=choice?.message?.content;
     const reasoningCharacters=typeof choice?.message?.reasoning_content==='string'?choice.message.reasoning_content.length:(choice?.reasoningCharacters||0);
     if(run&&debug){debug.usage=data.usage??null;debug.resultSummary={finishReason:choice?.finish_reason??null,contentCharacters:typeof content==='string'?content.length:0,reasoningCharacters,requestedMaxTokens:maxTokens};showDebug();}
-    if(choice?.finish_reason==='length')throw Error(reasoningCharacters&&(!content||!content.trim())?'接口报告输出或上下文长度达到上限：仅返回思考，没有译文。请关闭模型思考或改用非思考模型；原文未覆盖。':'接口报告输出或上下文长度达到上限，结果可能不完整；原文未覆盖。请检查用量与思考设置。');
-    if(typeof content!=='string'||!content.trim())throw Error('服务未返回可用文本。');
+    if(choice?.finish_reason==='length'){记日志('警告','接口',用途+'被输出上限截断 · '+毫秒文(Date.now()-起)+' · 发出额度 '+maxTokens+' · 返回 '+(typeof content==='string'?content.length:0)+' 字 · finish_reason=length'+(reasoningCharacters?' · 思考 '+reasoningCharacters+' 字':''));throw Error(reasoningCharacters&&(!content||!content.trim())?'接口报告输出或上下文长度达到上限：仅返回思考，没有译文。请关闭模型思考或改用非思考模型；原文未覆盖。':'接口报告输出或上下文长度达到上限，结果可能不完整；原文未覆盖。请检查用量与思考设置。');}
+    if(typeof content!=='string'||!content.trim()){记日志('错误','接口',用途+'没有可用文本 · '+毫秒文(Date.now()-起)+' · HTTP '+response.status+' · 返回 '+raw.length+' 字 · finish_reason='+String(choice?.finish_reason??'未给'));throw Error('服务未返回可用文本。');}
+    记日志('信息','接口',用途+'成功 · '+毫秒文(Date.now()-起)+' · 模型 '+(config.model||'未填')+' · 发出额度 '+maxTokens+' · 返回 '+content.length+' 字 · finish_reason='+String(choice?.finish_reason??'未给')+(reasoningCharacters?' · 思考 '+reasoningCharacters+' 字':''));
     return {content,usage:data.usage};
   }
-  function guard(r){if(disposed||r.cancelled||r.controller.signal.aborted||scope()!==r.scope||!matches(r.backup)||last()?.message!==r.identity)throw Error('消息、分支或聊天发生变化，已丢弃处理结果。');}
+  function guard(r){if(disposed||r.cancelled||r.controller.signal.aborted||scope()!==r.scope||!matches(r.backup)||last()?.message!==r.identity){记日志('警告','跳过',r.operation+'结果被丢弃：消息、分支或聊天在等待期间变了（没有写回正文）。');throw Error('消息、分支或聊天发生变化，已丢弃处理结果。');}}
   async function write(r,text){
     guard(r);writing=true;
     // 酒馆没有暴露「直接改写某楼正文」的接口，只能改 chat 后自己重绘这一层。
@@ -916,8 +1162,8 @@ color-scheme:light}
   // from='source'：处理这一楼最原始的备份（默认，重跑同一操作时结果稳定）。
   // from='current'：接手「当前显示的正文」（纠正完接着润色、自动处理接用户手改的正文）。
   function process(manual=false,from='source'){
-    if(run)return run.promise;
-    if(generation){say('请等待当前 AI 回复完整结束。');return Promise.resolve();}
+    if(run){记日志('信息','跳过','上一次处理还在进行，这次点击没有开始。');return run.promise;}
+    if(generation){记日志('信息','跳过','AI 还在回复中，这次没有开始。');say('请等待当前 AI 回复完整结束。');return Promise.resolve();}
     let b,blocks,messages,rawBlocks,protectedBlocks,requestSource,requestExpected,tags,p,sceneTag,scopeTag,wholeMessage=false;
     try{ensureCard();const item=last();if(!item)throw Error('没有 AI 回复。');
       b=validBackup();if(!b){b={scope:scope(),id:item.id,swipe:item.message.swipe_id??0,source:item.message.mes,expected:item.message.mes};}
@@ -933,8 +1179,12 @@ color-scheme:light}
       if(b.sceneTag===undefined)b.sceneTag=requestSource.includes('<'+sceneTag+'>')?sceneTag:'';
       scopeTag=b.sceneTag;
       rawBlocks=scenes(requestSource,scopeTag);wholeMessage=!scopeTag;
+      // 正文读写第一类证据：读的是哪一楼、多长、范围标签命中没有、切出几块。
+      记日志('信息','正文','读第 '+(b.id+1)+' 楼（'+requestSource.length+' 字）· 处理来源 '+(from==='current'?'当前显示的正文':'这一楼最原始的备份')
+        +' · 范围标签 '+(scopeTag?'<'+scopeTag+'> 命中，只处理标签内':'没有 <'+sceneTag+'>，整条都算正文')+' · 切出 '+rawBlocks.length+' 块'
+        +(tags.length?' · 保护标签 '+tags.length+' 个':''));
       protectedBlocks=rawBlocks.map(x=>protectText(x.text,tags));blocks=rawBlocks.map((x,i)=>({...x,text:protectedBlocks[i].text}));blocked=true;if(manual)saveConfig();apiRoot(config.base);if(!config.model.trim())throw Error('请先填写模型名称并保存接口。');
-    }catch(e){release();say(e.message+' 已解除等待，可修改设置后重试或继续聊天。');return Promise.resolve();}
+    }catch(e){记日志('错误','跳过','这次'+opOf(prefs().mode)+'没有开始：'+String(e?.message||e));release();say(e.message+' 已解除等待，可修改设置后重试或继续聊天。');return Promise.resolve();}
     remember(b);prune();persist();blocked=true;
     const operation=opOf(p.mode),r={operation,mode:p.mode,backup:b,identity:last().message,scope:scope(),controller:new host.AbortController(),cancelled:false,promise:null};run=r;paintActions();
     el('outgoing-status').textContent='本次操作是'+r.operation+'；下方主请求记录为历史结果，尚未进行新的换回检测。';
@@ -948,16 +1198,24 @@ color-scheme:light}
         let basis=null;
         if(r.mode==='correction'&&p.readBasis!==false){
           say('正在读取设定依据（世界书 / 角色卡 / 最近几楼）…');
-          try{basis=await buildBasis(last()?.message,p);}catch(e){basis=[];if(debug)debug.basisError=e.message;}
+          try{basis=await buildBasis(last()?.message,p);}catch(e){basis=[];if(debug)debug.basisError=e.message;记日志('警告','依据','读取设定依据失败，这次只看当前正文：'+String(e?.message||e));}
           if(disposed||run!==r||r.cancelled||scope()!==r.scope)return;
+          记依据日志(basis,last()?.message);
+        }else if(r.mode==='correction'){
+          记日志('信息','跳过','设置里关掉了「读取设定依据」，这次纠正只看当前正文。');
         }
         messages=requestMessages(blocks,p,basis);
         if(disposed||run!==r||r.cancelled)return;
+        {const 字=messages.reduce((n,m)=>n+String(m.content??'').length,0);
+         记日志('信息','请求','组装完成 · '+messages.length+' 条消息 · 共 '+字+' 字 · 待处理正文 '+blocks.reduce((n,x)=>n+x.text.length,0)+' 字 · 模式 '+r.operation);}
         debug={request:translationBody(config,messages),operation:r.operation,status:r.operation+'中',basis:basis?basisSizes(basis):null};showDebug();
-        const result=await call(messages,r.controller);guard(r);debug.response=result.content;debug.usage=result.usage;
-        if(r.mode==='correction')debug.corrections=correctionNotes(result.content);
+        const result=await call(messages,r.controller,config.maxTokens,r.operation);guard(r);debug.response=result.content;debug.usage=result.usage;
+        if(r.mode==='correction'){debug.corrections=correctionNotes(result.content);记纠错日志(result.content,debug.corrections);}
         showDebug();
-        const values=translated(result.content,blocks,scopeTag).map((v,i)=>unprotectText(v,protectedBlocks[i])),initial=spliceScenes(requestSource,rawBlocks,values),text=transferProtected(initial,requestExpected,b.expected,tags);await write(r,text);b.processed=text;persist();
+        const values=translated(result.content,blocks,scopeTag).map((v,i)=>unprotectText(v,protectedBlocks[i])),initial=spliceScenes(requestSource,rawBlocks,values),text=transferProtected(initial,requestExpected,b.expected,tags);
+        try{await write(r,text);}catch(e){记日志('错误','正文','写回第 '+(b.id+1)+' 楼失败：'+String(e?.message||e).slice(0,200));throw e;}
+        记日志('信息','正文','写回第 '+(b.id+1)+' 楼成功 · '+text.length+' 字 · 已重绘该楼层');
+        b.processed=text;persist();
         const notes=r.mode==='correction'?(debug.corrections||[]):[];
         lastAction=r.mode;
         if(r.mode==='correction')debug.status='已写回；共 '+notes.length+' 处改动';
@@ -967,14 +1225,14 @@ color-scheme:light}
         say(r.operation+'已写回并保存。'+(r.mode==='correction'
           ?(notes.length?'本次记下 '+notes.length+' 处改动，见下方「本次改动」。':'没有发现需要改动的地方。')
           :'可以继续聊天，也可以恢复原文或重新处理。'));
-      }catch(e){if(!disposed&&run===r&&!r.cancelled){const message=r.timedOut?r.operation+'已达到设定的 '+limit+' 秒等待上限。可提高等待上限后重试。':e.message;if(debug)debug.status=message;say(message+'\n已自动解除等待；保留当前正文，可以直接重试或继续聊天。');}}
+      }catch(e){if(!disposed&&run===r&&!r.cancelled){const message=r.timedOut?r.operation+'已达到设定的 '+limit+' 秒等待上限。可提高等待上限后重试。':e.message;记日志(r.timedOut?'错误':'警告','处理',r.operation+'没成功 · 第 '+(b.id+1)+' 楼 · '+String(message).slice(0,200));if(debug)debug.status=message;say(message+'\n已自动解除等待；保留当前正文，可以直接重试或继续聊天。');}}
       finally{host.clearTimeout(timer);host.clearInterval(ticker);if(run===r){run=null;release();}paintActions();paintChanges();showDebug();}
     })();return r.promise;
   }
-  async function restore(){if(generation){say('生成期间不能恢复，请先停止生成。');return;}if(run){cancel('取消处理后恢复…');await run.promise;}
-    const b=validBackup();if(!b){say('当前最后回复没有可恢复的备份。');return;}
+  async function restore(){if(generation){记日志('信息','跳过','查看原文没有开始：AI 还在回复。');say('生成期间不能恢复，请先停止生成。');return;}if(run){cancel('取消处理后恢复…');await run.promise;}
+    const b=validBackup();if(!b){记日志('信息','跳过','查看原文没有开始：这一楼没有可恢复的备份。');say('当前最后回复没有可恢复的备份。');return;}
     const r={operation:opOf(modeOf(prefs())),backup:b,identity:last().message,scope:scope(),controller:new host.AbortController()};
-    try{const result=b.processed||(b.expected!==b.source?b.expected:null);if(!result){say('还没有可对比的处理结果。');return;}b.processed=result;const text=b.expected===b.source?result:b.source;await write(r,text);release();paintChanges();say(text===b.source?'当前显示原文；再点一次可查看处理结果。':'当前显示最近处理结果；再点一次可查看原文。');}catch(e){say(e.message);}
+    try{const result=b.processed||(b.expected!==b.source?b.expected:null);if(!result){记日志('信息','跳过','查看原文没有开始：还没有可对比的处理结果。');say('还没有可对比的处理结果。');return;}b.processed=result;const text=b.expected===b.source?result:b.source;await write(r,text);release();paintChanges();记日志('信息','正文','第 '+(b.id+1)+' 楼已切到'+(text===b.source?'原文':'处理结果')+' · '+text.length+' 字');say(text===b.source?'当前显示原文；再点一次可查看处理结果。':'当前显示最近处理结果；再点一次可查看原文。');}catch(e){记日志('错误','正文','切换原文/处理结果失败：'+String(e?.message||e));say(e.message);}
   }
   // ---------- 圆形悬浮球 ----------
   // 做法照抄「系统面板」那颗球（44×44、点一下开合、可拖动、位置按比例存全局偏好），
@@ -1094,13 +1352,16 @@ color-scheme:light}
   el('theme-select').onchange=()=>{try{setTheme(el('theme-select').value);say('已切换为'+(theme==='light'?'清爽浅色':'深色')+'主题。');}catch(e){say(e.message);}};
   paintTheme();
   el('close').onclick=()=>closePanel();
-  const folds=['config','rules','terms','debug'];
+  const folds=['config','rules','terms','debug','log'];
   let openFold=null;
   function fold(name){const next=openFold===name?null:name;openFold=next;
     for(const item of folds){const isOpen=item===next;el(item).setAttribute('aria-expanded',String(isOpen));el(item+'-pane').setAttribute('data-expanded',String(isOpen));el(item+'-pane').inert=!isOpen;}
     if(name==='debug')showDebug();
+    if(name==='log')画日志();
   }
   for(const name of folds)el(name).onclick=()=>fold(name);
+  el('log-copy').onclick=()=>复制日志();
+  el('log-clear').onclick=()=>清空日志();
   el('changes-fold').onclick=()=>toggleChanges();
   function saveConfig(){
     if(run||testRun)throw Error('请等待请求完成或取消后再修改接口。');
@@ -1111,6 +1372,7 @@ color-scheme:light}
     // protectedTags / outerTag 不在这个面板里，是「保护标签与术语」那一栏的字段，重建 config 时必须带着。
     config={protectedTags:config.protectedTags,outerTag:config.outerTag,base:el('base').value.trim(),model:el('model').value.trim(),maxTokens:tokens,timeoutSeconds,thinkingMode};secret=el('key').value;redactions.add(secret);persist();
     if(el('remember').checked&&secret)host.localStorage.setItem(KEY_STORE,JSON.stringify({base:apiRoot(config.base),key:secret}));else forgetKey();
+    记日志('信息','接口','接口已保存 · 地址 '+apiRoot(config.base)+' · 模型 '+(config.model||'未填')+' · 最大输出 '+tokens+' · 等待上限 '+timeoutSeconds+' 秒 · 密钥 '+(secret?'已填':'未填')+'（'+(el('remember').checked&&secret?'已记在此浏览器':'只保留在当前页面')+'）');
   }
   el('save-config').onclick=()=>{try{saveConfig();apiSay(el('remember').checked?'接口已保存，密钥已记在此浏览器。':'接口已保存；密钥只保留在当前页面。');}catch(e){apiSay(e.message);}};
   el('model-list').onchange=()=>{if(el('model-list').value){el('model').value=el('model-list').value;paintThinking(true);}};
@@ -1140,30 +1402,33 @@ color-scheme:light}
   }catch(e){say(e.message);return;}
     process(true,'current');};
   async function probe(kind){
-    if(testRun||run){apiSay('请先完成或取消当前请求。');return;}
-    try{saveConfig();if(kind==='test'&&!config.model)throw Error('请先获取并选择模型，或手动填写模型名称。');}catch(e){apiSay(e.message);return;}
+    const 名=kind==='test'?'连接测试':'获取模型列表';
+    if(testRun||run){记日志('信息','跳过',名+'没有开始：还有请求在进行。');apiSay('请先完成或取消当前请求。');return;}
+    try{saveConfig();if(kind==='test'&&!config.model)throw Error('请先获取并选择模型，或手动填写模型名称。');}catch(e){记日志('警告','跳过',名+'没有开始：'+String(e?.message||e));apiSay(e.message);return;}
     const controller=new host.AbortController();testRun=controller;
     const button=el(kind),label=kind==='test'?'连接测试':'获取模型列表';
     button.disabled=true;button.textContent=kind==='test'?'测试中…':'获取中…';
     const timer=host.setTimeout(()=>controller.abort(),30000);
+    const 起=Date.now();
     apiSay(kind==='test'?'正在测试当前填写的接口（最多等待 30 秒）…':'正在获取模型列表（最多等待 30 秒）…');
     try{
       if(kind==='test'){
-        await call([{role:'user',content:'请仅回复 OK。'}],controller,64);
+        await call([{role:'user',content:'请仅回复 OK。'}],controller,64,'连接测试');
         apiSay('连接成功：模型已返回文本。可以开始手动处理测试。');
       }else{
         const response=await host.fetch(apiRoot(config.base)+'/models',{headers:secret?{Authorization:'Bearer '+secret}:{},signal:controller.signal,credentials:'omit'});
-        if(!response.ok)throw Error('模型列表 HTTP '+response.status+'；服务可能不支持 /models，也可以手填模型。');
+        if(!response.ok){记日志('错误','接口','获取模型列表失败 · HTTP '+response.status+' · '+毫秒文(Date.now()-起));throw Error('模型列表 HTTP '+response.status+'；服务可能不支持 /models，也可以手填模型。');}
         const data=await response.json();if(controller.signal.aborted)throw Error('已取消');
-        if(!Array.isArray(data.data))throw Error('模型列表格式不兼容；仍可手动填写模型。');
+        if(!Array.isArray(data.data)){记日志('错误','接口','模型列表格式不兼容 · '+毫秒文(Date.now()-起));throw Error('模型列表格式不兼容；仍可手动填写模型。');}
         const ids=[...new Set(data.data.map(x=>x?.id).filter(x=>typeof x==='string'&&x.trim()))].sort();
         const select=el('model-list');select.replaceChildren();
         const blank=doc.createElement('option');blank.value='';blank.textContent='请选择模型';select.appendChild(blank);
         for(const id of ids){const option=doc.createElement('option');option.value=id;option.textContent=id;select.appendChild(option);}
         select.value=ids.includes(config.model)?config.model:'';
+        记日志('信息','接口','获取模型列表成功 · '+毫秒文(Date.now()-起)+' · 返回 '+ids.length+' 个模型');
         apiSay(ids.length?'已获取 '+ids.length+' 个模型，请在下拉列表选择，再点击连接测试。':'服务返回空模型列表；可以手动填写模型。');
       }
-    }catch(e){apiSay(controller.signal.aborted?'请求已取消或超过 30 秒；请检查网络与服务。':e instanceof TypeError?'无法连接服务：可能是网络或 CORS 跨域限制。':e.message);}
+    }catch(e){记日志('错误','接口',名+'失败 · '+毫秒文(Date.now()-起)+' · '+String(controller.signal.aborted?'超过 30 秒已中断':e?.message||e).slice(0,200));apiSay(controller.signal.aborted?'请求已取消或超过 30 秒；请检查网络与服务。':e instanceof TypeError?'无法连接服务：可能是网络或 CORS 跨域限制。':e.message);}
     finally{host.clearTimeout(timer);testRun=null;button.disabled=false;button.textContent=label;}
   }
   el('test').onclick=()=>probe('test');el('models').onclick=()=>probe('models');
@@ -1207,10 +1472,11 @@ color-scheme:light}
       const result=originalForRequest(payload.messages,original,expected,record.backup.sceneTag);
       payload.messages=result.messages;next={...init,body:JSON.stringify(payload)};
       outcome={status:'已换回最后正文，正在发送主请求。',promptRegexApplied:filtered,depth,messageIndex:result.index,contentPart:result.part,blocks:result.blocks,chatMessageId:record.backup.id,swipeId:record.backup.swipe,generationType:generation.type||'normal',original:result.original,chatRecord:'未修改',worldbook:'保留已组装内容'};
+      记日志('信息','主请求','已把发送内容换回原文 · 第 '+(record.backup.id+1)+' 楼 · '+result.blocks+' 块 · 正则深度 '+depth+(filtered?'':' · 这台酒馆没有正则接口，按原文处理'));
       reportOutgoing(outcome);
-    }catch(e){reportOutgoing({status:'未替换：'+e.message});}
-    try{const response=await originalFetch.call(host,input,next);if(outcome&&outgoing===outcome)reportOutgoing({...outcome,status:response.ok?'已换回原文并发送；主接口已响应。':'已换回原文，但主接口返回 HTTP '+response.status+'。'});return response;}
-    catch(error){if(outcome&&outgoing===outcome)reportOutgoing({...outcome,status:'已换回原文，但主请求失败或取消。'});throw error;}
+    }catch(e){记日志('警告','主请求','这一轮没有换回原文：'+String(e?.message||e).slice(0,200));reportOutgoing({status:'未替换：'+e.message});}
+    try{const response=await originalFetch.call(host,input,next);if(outcome&&outgoing===outcome){if(!response.ok)记日志('警告','主请求','主接口返回 HTTP '+response.status);reportOutgoing({...outcome,status:response.ok?'已换回原文并发送；主接口已响应。':'已换回原文，但主接口返回 HTTP '+response.status+'。'});}return response;}
+    catch(error){if(outcome&&outgoing===outcome){记日志('错误','主请求','主请求失败或取消：'+String(error?.message||error).slice(0,200));reportOutgoing({...outcome,status:'已换回原文，但主请求失败或取消。'});}throw error;}
   }
   // Capture user sends before Tavern can append a message or schedule Generate.
   // No disabled state is written to Tavern controls; the guard is live only for this run.
@@ -1246,12 +1512,24 @@ color-scheme:light}
   function chatChanged(){closeTemplateEditor();if(pendingStart)pendingStart.cancelled=true;cancel('聊天已切换，旧处理不会写入新聊天。');release();generation=null;backup=null;backups=[];debug=null;outgoing=null;records=[];persist();clearChanges('');paintCard();showDebug();}
   function messageChanged(){if(writing)return;if(run&&!matches(run.backup)){cancel('消息已改变，处理结果将丢弃。');release();}if(!generation){validBackup();prune();persist();}paintActions();paintChanges();}
   function cleanup(){host.removeEventListener?.('click',blockUserSend,true);host.removeEventListener?.('keydown',blockUserSend,true);host.removeEventListener?.('submit',blockUserSend,true);host.removeEventListener?.('resize',fitViewport);host.visualViewport?.removeEventListener('resize',fitViewport);host.visualViewport?.removeEventListener('scroll',fitViewport);disposed=true;cancel('脚本已关闭。');testRun?.abort();release();subs.forEach(s=>s.stop());if(host.fetch===mainFetch)host.fetch=originalFetch;records=[];root.remove();delete host[ID];}
-  try{if(typeof ctx().updateMessageBlock!=='function'||typeof ctx().eventSource?.on!=='function'||!ctx().eventTypes.GENERATION_STARTED||!ctx().eventTypes.GENERATION_ENDED||!ctx().eventTypes.GENERATION_AFTER_COMMANDS)throw Error('当前酒馆缺少消息刷新或生成事件接口，插件无法运行。');on('GENERATION_STARTED',before);on('GENERATION_AFTER_COMMANDS',()=>{if(generation?.stopped||pendingStart?.cancelled||pendingStart&&pendingStart.scope!==scope())ctx().stopGeneration();pendingStart=null;});on('GENERATION_ENDED',ended);on('GENERATION_STOPPED',()=>{if(generation)generation.stopped=true;if(pendingStart){pendingStart.cancelled=true;cancel('等待中的生成已停止。');release();}});on('CHAT_CHANGED',chatChanged);on('CHAT_COMPLETION_SETTINGS_READY',ready);host.fetch=mainFetch;for(const e of ['MESSAGE_SWIPED','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_UPDATED'])on(e,messageChanged);say('已就绪。自动处理默认关闭；设置按角色保存。');}catch(e){say(e.message);}
+  // 启动：每一步成败都留一条。插件在开发这事上最容易出的就是「装上没反应」，而没反应是没日志可查的。
+  try{
+    const c=ctx();
+    if(typeof c?.updateMessageBlock!=='function')throw Error('当前酒馆缺少消息刷新接口');
+    if(typeof c?.eventSource?.on!=='function')throw Error('当前酒馆缺少事件接口');
+    for(const 名 of ['GENERATION_STARTED','GENERATION_ENDED','GENERATION_AFTER_COMMANDS'])if(!c.eventTypes?.[名])throw Error('当前酒馆缺少'+名+'事件');
+    记日志('信息','启动','酒馆接口检查通过（消息刷新 / 事件 / 生成事件）');
+    on('GENERATION_STARTED',before);on('GENERATION_AFTER_COMMANDS',()=>{if(generation?.stopped||pendingStart?.cancelled||pendingStart&&pendingStart.scope!==scope())ctx().stopGeneration();pendingStart=null;});on('GENERATION_ENDED',ended);on('GENERATION_STOPPED',()=>{if(generation)generation.stopped=true;if(pendingStart){pendingStart.cancelled=true;cancel('等待中的生成已停止。');release();}});on('CHAT_CHANGED',chatChanged);on('CHAT_COMPLETION_SETTINGS_READY',ready);host.fetch=mainFetch;for(const e of ['MESSAGE_SWIPED','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_UPDATED'])on(e,messageChanged);
+    记日志('信息','启动','已订阅 '+subs.length+' 个事件，主请求换回原文已挂上');
+    say('已就绪。自动处理默认关闭；设置按角色保存。');
+  }catch(e){记日志('错误','启动','插件无法运行：'+String(e?.message||e));say(e.message);}
   try{el('protected-tags').value=protectedTagNames(config.protectedTags,config.outerTag).map(n=>'<'+n+'>').join('\n');}catch(_){el('protected-tags').value=config.protectedTags;}
   el('protected-tags').oninput=()=>{config.protectedTags=el('protected-tags').value;persist();};
   // 正文范围标签：留空 = 整条回复都处理。填错名字（不是合法标签名）时按默认名处理，不静默变成「整条」。
   el('outer-tag').value=config.outerTag;
   el('outer-tag').oninput=()=>{const raw=el('outer-tag').value,normalized=normalizeSceneTag(raw);config.outerTag=raw.trim()?(normalized||DEFAULT_SCENE_TAG):'';persist();};
   el('base').value=config.base;el('model').value=config.model;el('tokens').value=config.maxTokens;el('timeout').value=config.timeoutSeconds;el('thinking-mode').value=config.thinkingMode;paintThinking();loadKey();paintCard();validBackup();showDebug();
+  记日志('信息','启动','面板已就绪 · 版本 '+TUTU_VERSION+' · 历史日志 '+runLog.length+' 条 · 接口 '+(config.base?'已填':'未填')+' · 模型 '+(config.model||'未填')+' · 密钥 '+(secret?'已填':'未填')+' · 范围标签 '+(config.outerTag?'<'+config.outerTag+'>':'留空（整条都处理）'));
+  画日志();
   host[ID]={open:()=>openPanel(),root,panel};window.addEventListener('pagehide',cleanup,{once:true});
 })();
