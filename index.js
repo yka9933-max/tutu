@@ -133,6 +133,83 @@ function correctionNotes(text){
     return data.corrections.map(x=>typeof x==='string'?{where:x,reason:''}:{where:String(x?.where??'').slice(0,80),reason:String(x?.reason??'').slice(0,200)}).filter(x=>x.where||x.reason).slice(0,12);
   }catch(_){return [];}
 }
+// ---------- 「本次改动」：用 where 当锚点在改前 / 改后两份正文里定位 ----------
+// 逐字比较两份正文，给出一张「原文位置 → 改后位置」的对照表（只登记两边一样的字），
+// 外加被改写的那几块 [原文起, 原文止, 改后起, 改后止]。
+// 用带前瞻的两指针推进：正文多长都只走一遍，手机上点一下也立刻出结果。
+// 一样的字一定登记成一对，改动的地方留空——锚点是否还在、改动落在哪，就靠这两样说话。
+// 重新对齐时不能只看「哪个字先对上」：正文里常见重复用字，先对上的往往是巧合。
+// 所以把一小片范围里的候选都算一遍，选「对上之后能连着一样最久」的那个，平手时选挪得最少的。
+const ALIGN_CELLS=200,ALIGN_RUN=10,ALIGN_TIE=2;
+function editPairs(before,after){
+  const n=before.length,m=after.length,pairs=[],regions=[];
+  if(!n||!m)return {pairs,regions};
+  const same=(i,j)=>before[i]===after[j];
+  let i=0,j=0;
+  // 对齐之后先把连着的相同字一次收完，收到第一处不同为止。
+  function lockstep(){
+    while(i<n&&j<m&&same(i,j)){pairs.push([i,j]);i++;j++;}
+    return i>=n&&j>=m;
+  }
+  // 从 (i,j) 起，往后最多看 ALIGN_RUN 个字，数一数能连着一样多少。
+  function agree(a,b){
+    let k=0;const top=Math.min(ALIGN_RUN,n-a,m-b);
+    while(k<top&&same(a+k,b+k))k++;
+    return k;
+  }
+  if(lockstep())return {pairs,regions};
+  while(i<n||j<m){
+    if(i>=n||j>=m){regions.push([i,n,j,m]);break;}
+    // 在这一小片范围里挑最好的重新对齐点；一个都挑不出来就把剩下的整段当成改写。
+    let best=null,spent=0;
+    for(let shift=1;shift<=ALIGN_CELLS&&spent<ALIGN_CELLS;shift++){
+      for(const da of (shift<=ALIGN_TIE?[0,shift]:[shift,0])){
+        const db=shift-da;
+        const x=i+da,y=j+db;
+        spent++;
+        if(x>=n||y>=m)continue;
+        if(!same(x,y))continue;
+        const run=agree(x,y);
+        if(!best||run>best.run||(run===best.run&&shift<best.shift))best={x,y,run,shift};
+        if(run>=ALIGN_RUN)shift=ALIGN_CELLS;      // 已经连着一大片一样，不用再找了
+      }
+    }
+    if(!best||(!best.run&&i<n&&j<m)){regions.push([i,n,j,m]);break;}
+    regions.push([i,best.x,j,best.y]);
+    i=best.x;j=best.y;
+    if(lockstep())break;
+  }
+  return {pairs,regions};
+}
+// 判据：模型给的锚点（原文里不变的一小段）到底落在哪一段。宁可说找不到，也不指错地方。
+// 做法：把原文与改后正文逐字对上，只把「紧挨着改动的前后文」当锚点的落脚处；
+// 锚点整段都落在被改写的那一块里 → 它就是被改掉的那部分，照直说找不到。
+// 返回：lead（改动前的上文，含锚点）、beforeMid / afterMid（被改掉的 / 改成的那部分）、trail（改动后的下文）。
+function compareCorrection(anchor,source,result){
+  const a=String(anchor??'').trim();
+  const src=String(source??''),res=String(result??'');
+  const nothing={ok:false,text:'还没有可对照的正文。'};
+  if(!a)return nothing;
+  if(!src.trim())return nothing;
+  if(!res.trim())return {ok:false,text:'处理结果没有保存，没法对照这一处。'};
+  const at=src.indexOf(a);
+  if(at<0)return {ok:false,text:'这一段在原文里没有原样出现，没法指认位置。'};
+  if(src===res)return {ok:false,text:'这一处改前改后看不出差别。'};
+  const {pairs,regions}=editPairs(src,res);
+  if(!pairs.length)return {ok:false,text:'这一段在改后的正文里已经找不到（贴着它一起被改掉了）。'};
+  const map=new Map(pairs);
+  // 锚点每个字都得在改后找到落点，而且不能落在被改写的那几块里。
+  for(let k=0;k<a.length;k++){
+    const y=map.get(at+k);
+    if(y===undefined)return {ok:false,text:'这一段在改后的正文里已经找不到（贴着它一起被改掉了）。'};
+    if(regions.some(r=>y>=r[2]&&y<r[3]))return {ok:false,text:'这一段在改后的正文里已经找不到（贴着它一起被改掉了）。'};
+  }
+  if(!regions.length)return {ok:false,text:'这一处改前改后看不出差别。'};
+  // 找锚点后面最近的那一块改写（多数 correction 只改一处；改了好几处时，这里给的是离锚点最近的那处）。
+  const near=regions.find(r=>r[0]>=at)||regions[regions.length-1];
+  return {ok:true,anchor:a,lead:src.slice(Math.max(0,near[0]-60),near[0]),trail:src.slice(near[1],near[1]+40),
+    beforeMid:src.slice(near[0],near[1]),afterMid:res.slice(near[2],near[3]),more:regions.length>1,changedAt:near[0],anchorAt:at,same:false};
+}
 function spliceScenes(source,blocks,values) {
   let result=source;
   for(let i=blocks.length-1;i>=0;i--) result=result.slice(0,blocks[i].start)+values[i]+result.slice(blocks[i].end);
@@ -274,9 +351,10 @@ function transferProtected(target,reference,current,tags) {
     return wiModule;
   }
   // 扫描器优先用酒馆自己注入的 checkWorldInfo；没有才去动态 import。
+  // 注意这里返回的是「上下文对象」本身，不是取上下文的函数：返回函数会被 await 当成可调用对象再调一次。
   async function worldInfoScanner(){
-    const direct=ctx().checkWorldInfo;
-    if(typeof direct==='function')return ctx;
+    const c=ctx();
+    if(typeof c?.checkWorldInfo==='function')return c;
     let mod;try{mod=await worldInfoModule();}catch(_){return null;}
     return typeof mod?.checkWorldInfo==='function'?mod:null;
   }
@@ -398,6 +476,8 @@ function transferProtected(target,reference,current,tags) {
   let backups=Array.isArray(saved.backups)?saved.backups:(saved.backup?[saved.backup]:[]);
   if(!Number.isInteger(config.timeoutSeconds)||config.timeoutSeconds<30||config.timeoutSeconds>1800)config.timeoutSeconds=300;
   let enabled=false,secret='',run=null,blocked=false,waiters=[],generation=null,disposed=false,writing=false,debug=null,testRun=null,pendingStart=null;
+  // 「本次改动」跟着最近一次纠正的结果留在内存里（只给当前这次看，不写进存档）。清掉即失效。
+  let changes=null,openChange=-1,changesExpanded=false;
   let outgoing=null,records=[],lastAction=null;
   const redactions=new Set();
   const root=doc.createElement('div');root.id='tutu-polish';root.setAttribute('data-theme',config.theme);
@@ -516,6 +596,27 @@ color-scheme:light}
 #tutu-polish .mt-setting-block label{display:grid;gap:8px;margin:0}
 #tutu-polish .mt-setting-block input,#tutu-polish .mt-setting-block textarea,#tutu-polish .mt-setting-block small,#tutu-polish .mt-setting-block button{margin:0}
 #tutu-polish .mt-setting-block button{justify-self:start}
+/* 「本次改动」：跟着 --mt-* 主题走，深浅两套都不用另写颜色。 */
+#tutu-polish .mt-changes{flex-shrink:0}
+#tutu-polish .mt-changes .mt-fold{background:var(--mt-card);border-bottom:1px solid var(--mt-border-4);padding:10px 16px;font-size:13px;font-weight:600}
+#tutu-polish .mt-changes .mt-fold[aria-expanded=true]{background:var(--mt-card);color:var(--mt-fold-open-text);box-shadow:inset 3px 0 var(--mt-accent)}
+#tutu-polish .mt-changes .mt-pane{background:var(--mt-card-soft)}
+#tutu-polish .mt-change-list{max-height:190px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;display:grid;gap:5px}
+#tutu-polish .mt-change-row{display:grid;grid-template-columns:minmax(0,1fr) 30px;gap:6px;align-items:stretch}
+#tutu-polish .mt-change-row button{min-width:0;margin:0;text-align:left;overflow-wrap:anywhere}
+#tutu-polish .mt-change-row .mt-change-pick{padding:7px 9px;font-size:12.5px;line-height:1.5}
+#tutu-polish .mt-change-row [data-changes-close]{display:flex;align-items:center;justify-content:center;padding:0;font-size:13px;min-height:34px}
+#tutu-polish .mt-change-row .mt-change-pick[data-on=true]{background:var(--mt-fold-open);border-color:var(--mt-border-checked)}
+#tutu-polish .mt-change-detail{margin:8px 0 0;padding:8px 9px;border:1px solid var(--mt-border-4);border-radius:8px;background:var(--mt-card)}
+#tutu-polish .mt-change-detail p{margin:0 0 6px}
+#tutu-polish .mt-change-detail p:last-child{margin-bottom:0}
+#tutu-polish .mt-change-detail .mt-why{font-size:12px;color:var(--mt-text-3)}
+#tutu-polish .mt-side{border-left:3px solid var(--mt-border-2)}
+#tutu-polish .mt-side>span{display:block;font-size:12px;color:var(--mt-text-4)}
+#tutu-polish .mt-side del{text-decoration:line-through;background:var(--mt-work-c);color:var(--mt-text);border-radius:3px;padding:0 2px}
+#tutu-polish .mt-side ins{text-decoration:none;background:var(--mt-on-bg);color:var(--mt-text);box-shadow:inset 0 -1px 0 var(--mt-on-border);border-radius:3px;padding:0 2px}
+#tutu-polish .mt-faded{color:var(--mt-text-4)}
+#tutu-polish .mt-hit{background:var(--mt-fold-open);border-radius:3px;padding:0 2px}
 </style>
 <section hidden aria-label="tutu">
   <header class="mt-head"><div class="mt-heading"><strong>tutu</strong><button type="button" data-theme-toggle class="mt-compact" title="在深色与清爽浅色之间切换">浅色主题</button><button type="button" data-close class="mt-compact">收起面板</button></div><small data-card></small></header>
@@ -556,7 +657,7 @@ color-scheme:light}
     </div></div></div></div>
     <small style="margin:12px 9px 4px">用于当前模式的请求，按角色保存。发送顺序：前置 → 当前模式要求与术语 → 正文 → 尾部。身份按所选 role 发送，不启用接口专属预填充；接口是否接受尾部助手消息取决于服务。</small>
   </div>
-  <footer class="mt-footer"><p class="mt-hint">当前功能：<span data-mode-current>润色</span></p><div class="mt-mode-pair mt-mode-set"><div class="mt-mode"><button type="button" data-run-polish>润色</button></div><div class="mt-mode"><button type="button" data-run-correction>纠正</button></div></div><div class="mt-actions"><button type="button" data-process>润色／重做最后回复</button><button type="button" data-restore>查看原文</button></div><div class="mt-mode" data-next hidden><button type="button" data-next-polish>接着润色这一楼</button><small>正文 → 纠正 → 润色 是一条链：纠正只管把事说对，文风交给下一步。点这里直接对刚纠正过的这一楼做润色，用的还是你自己的润色提示词。</small></div><p data-status role="status" aria-live="polite"></p></footer>
+  <footer class="mt-footer"><p class="mt-hint">当前功能：<span data-mode-current>润色</span></p><div class="mt-mode-pair mt-mode-set"><div class="mt-mode"><button type="button" data-run-polish>润色</button></div><div class="mt-mode"><button type="button" data-run-correction>纠正</button></div></div><div class="mt-actions"><button type="button" data-process>润色／重做最后回复</button><button type="button" data-restore>查看原文</button></div><div class="mt-mode" data-next hidden><button type="button" data-next-polish>接着润色这一楼</button><small>正文 → 纠正 → 润色 是一条链：纠正只管把事说对，文风交给下一步。点这里直接对刚纠正过的这一楼做润色，用的还是你自己的润色提示词。</small></div><p data-status role="status" aria-live="polite"></p><div class="mt-changes" data-changes hidden><button type="button" class="mt-fold" data-changes-fold aria-expanded="false" aria-controls="mt-changes-list">本次改动</button><div class="mt-pane" data-changes-pane id="mt-changes-list" data-expanded="false" inert><div class="mt-pane-inner"><div class="mt-pad"><div class="mt-change-list" data-changes-list></div><div data-changes-detail></div></div></div></div></div></footer>
 </section><button type="button" data-open aria-expanded="false" aria-label="打开 tutu 面板" title="点一下打开面板，按住可以拖到别处">🐑</button>
 `;
   (doc.documentElement||doc.body).appendChild(root);
@@ -577,6 +678,7 @@ color-scheme:light}
   function last(){const chat=ctx().chat;for(let i=chat.length-1;i>=0;i--)if(!chat[i].is_user&&!chat[i].is_system)return {id:i,message:chat[i]};return null;}
   function aiRows(){return ctx().chat.map((message,id)=>({message,id})).filter(x=>!x.message.is_user&&!x.message.is_system);}
   function matchesAny(b){const m=ctx().chat[b?.id];if(!(b&&m&&!m.is_user&&!m.is_system&&b.scope===scope()&&b.swipe===(m.swipe_id??0)))return false;
+    if(!(b&&m&&!m.is_user&&!m.is_system&&b.scope===scope()&&b.swipe===(m.swipe_id??0)))return false;
     if(b.expected===m.mes)return true;
     try{const tags=b.protectedTags||protectedTagNames(config.protectedTags,config.outerTag);const source=transferProtected(b.source,b.expected,m.mes,tags),processed=b.processed?transferProtected(b.processed,b.expected,m.mes,tags):null;b.source=source;if(processed)b.processed=processed;b.expected=m.mes;return true;}catch(_){return false;}
   }
@@ -597,6 +699,97 @@ color-scheme:light}
     el('mode-current').textContent=op;
     el('next').hidden=!(mode==='correction'&&lastAction==='correction'&&!active);
     for(const key of ['polish','correction'])el('run-'+key).setAttribute('data-on',String(mode===key));
+  }
+  // ---------- 「本次改动」：主按钮下面那块清单与改前 / 改后对照 ----------
+  // 数据只认「当前这一楼 + 它的备份」：换楼、换聊天、换回原文之后，清单自己失效。
+  function sameTarget(){
+    if(!changes||!changes.notes||!changes.notes.length)return false;
+    const item=last();if(!item||item.id!==changes.id)return false;
+    // 用对象身份会误伤：写回时会整个替换掉 chat 里那一项。这里只认「还是同一楼、原文备份仍对得上」。
+    return !!lookup({id:changes.id});
+  }
+  function currentPair(){
+    const b=backup&&backup.id===changes.id?backup:lookup({id:changes.id});
+    const result=b?.processed||(b&&b.expected!==b.source?b.expected:null);
+    if(!b||!result)return null;
+    return {source:b.source,result};
+  }
+  // 三块：改动前那几十个字（含锚点，当上下文）、被改掉的那部分、改成的那部分，末尾再接一小截下文。
+  function ctxHtml(lead,anchor){
+    const text=String(lead??''),keep=text.length>60?'…'+text.slice(-60):text;
+    const at=anchor?keep.lastIndexOf(anchor):-1;
+    if(at<0)return '<p class="mt-side"><span>上文</span><span class="mt-faded">'+(keep||'（这一段就在开头）')+'</span></p>';
+    return '<p class="mt-side"><span>上文</span><span class="mt-faded">'+keep.slice(0,at)+'</span><span class="mt-hit">'+keep.slice(at)+'</span></p>';
+  }
+  function partHtml(label,text,cls){
+    const body=String(text??'');
+    return '<p class="mt-side"><span>'+label+'</span>'+(body?'<'+cls+' class="mt-hit">'+body+'</'+cls+'>':'<span class="mt-faded">（没有内容）</span>')+'</p>';
+  }
+  function renderDetail(host,item,scroll){
+    const box=el('changes-detail');box.replaceChildren();box.hidden=false;box.appendChild(host);
+    const pair=currentPair();
+    const cmp=pair?compareCorrection(item.where,pair.source,pair.result):{ok:false,text:'处理结果没有保存，没法对照这一处。'};
+    const head=doc.createElement('p');head.className='mt-why';head.textContent=item.where?'位置：'+item.where:'（这一条没给位置）';box.appendChild(head);
+    if(cmp.ok){
+      box.insertAdjacentHTML('beforeend',ctxHtml(cmp.lead,cmp.anchor));
+      box.insertAdjacentHTML('beforeend',partHtml('改前',cmp.beforeMid,'del'));
+      box.insertAdjacentHTML('beforeend',partHtml('改后',cmp.afterMid,'ins'));
+      if(cmp.trail)box.insertAdjacentHTML('beforeend','<p class="mt-side"><span>下文</span><span class="mt-faded">'+cmp.trail+'</span></p>');
+      if(cmp.more){const more=doc.createElement('p');more.className='mt-why';more.textContent='这一楼还有别的改动，这里显示的是离锚点最近的一处。';box.appendChild(more);}
+    }else{
+      const miss=doc.createElement('p');miss.textContent=cmp.text;box.appendChild(miss);
+    }
+    if(item.reason){const why=doc.createElement('p');why.className='mt-why';why.textContent='为什么改：'+item.reason;box.appendChild(why);}
+    if(scroll)box.scrollIntoView?.({block:'nearest'});
+  }
+  function renderChangeList(scroll){
+    const list=el('changes-list');list.replaceChildren();el('changes-detail').replaceChildren();el('changes-detail').hidden=true;
+    if(openChange>=changes.notes.length)openChange=-1;
+    changes.notes.forEach((item,i)=>{
+      const row=doc.createElement('div');row.className='mt-change-row';
+      const pick=doc.createElement('button');pick.type='button';pick.className='mt-change-pick';
+      pick.textContent=(item.where||'（这一条没给位置）')+(item.reason?'　'+item.reason:'');
+      pick.setAttribute('data-on',String(openChange===i));pick.setAttribute('aria-pressed',String(openChange===i));
+      pick.onclick=()=>{openChange=openChange===i?-1:i;renderChangeList(true);};
+      const close=doc.createElement('button');close.type='button';close.setAttribute('data-changes-close','');close.title='清掉这份清单';close.setAttribute('aria-label','清掉这份清单');close.textContent='✕';
+      close.onclick=()=>clearChanges('改动清单已清掉；正文保持现在的样子。');
+      row.appendChild(pick);row.appendChild(close);list.appendChild(row);
+    });
+    if(openChange>=0){const host=doc.createElement('div');renderDetail(host,changes.notes[openChange],scroll);}
+  }
+  function clearChanges(message){
+    changes=null;openChange=-1;changesExpanded=false;
+    el('changes').hidden=true;el('changes-fold').setAttribute('aria-expanded','false');
+    el('changes-pane').setAttribute('data-expanded','false');el('changes-pane').inert=true;
+    el('changes-list').replaceChildren();el('changes-detail').replaceChildren();
+    if(message)say(message);
+  }
+  function paintChanges(){
+    if(!sameTarget()){changes=null;openChange=-1;
+      if(!el('changes').hidden)clearChanges('');return;}
+    const b=lookup({id:changes.id});
+    // 换回原文之后对照就没意义了：只是先藏起来。再切回处理结果，清单还在，不会丢。
+    el('changes').hidden=!!(b&&b.expected===b.source);
+    if(el('changes').hidden)return;
+    el('changes-fold').textContent='本次改动 '+changes.notes.length+' 处';
+    el('changes-fold').setAttribute('aria-expanded',String(changesExpanded));
+    el('changes-pane').setAttribute('data-expanded',String(changesExpanded));el('changes-pane').inert=!changesExpanded;
+    if(changesExpanded)renderChangeList();
+  }
+  function toggleChanges(){
+    if(!el('changes').hidden)changesExpanded=!changesExpanded;
+    if(changesExpanded)openChange=-1;
+    paintChanges();
+  }
+  // 纠正成功那一刻把清单接过来（空数组就清掉上一次的），之后它只活在这一楼。
+  function noteChanges(notes,r){
+    if(r.mode!=='correction'){clearChanges('');return;}
+    if(!notes.length){clearChanges('');return;}
+    changes={id:r.backup.id,notes};
+    openChange=-1;changesExpanded=true;
+    el('changes').hidden=true;   // 先标脏，交给 paintChanges 按当前备份重新判定
+    paintChanges();
+    el('changes').scrollIntoView?.({block:'nearest'});
   }
   function paintOriginal(){const on=prefs().sendOriginal===true;el('send-original').textContent='发送时使用原文：'+(on?'开启':'关闭');el('send-original').setAttribute('data-on',String(on));el('send-original').setAttribute('aria-pressed',String(on));}
   function paintBasis(){let on=true;try{on=prefs().readBasis!==false;}catch(_){}
@@ -769,16 +962,19 @@ color-scheme:light}
         lastAction=r.mode;
         if(r.mode==='correction')debug.status='已写回；共 '+notes.length+' 处改动';
         else debug.status='已写回';
+        noteChanges(notes,r);
         release();
-        say(r.operation+'已写回并保存。'+(notes.length?'本次记下 '+notes.length+' 处改动，可在「本次调试」里查看。':r.mode==='correction'?'没有发现需要改动的地方。':'可以继续聊天，也可以恢复原文或重新处理。'));
+        say(r.operation+'已写回并保存。'+(r.mode==='correction'
+          ?(notes.length?'本次记下 '+notes.length+' 处改动，见下方「本次改动」。':'没有发现需要改动的地方。')
+          :'可以继续聊天，也可以恢复原文或重新处理。'));
       }catch(e){if(!disposed&&run===r&&!r.cancelled){const message=r.timedOut?r.operation+'已达到设定的 '+limit+' 秒等待上限。可提高等待上限后重试。':e.message;if(debug)debug.status=message;say(message+'\n已自动解除等待；保留当前正文，可以直接重试或继续聊天。');}}
-      finally{host.clearTimeout(timer);host.clearInterval(ticker);if(run===r){run=null;release();}paintActions();showDebug();}
+      finally{host.clearTimeout(timer);host.clearInterval(ticker);if(run===r){run=null;release();}paintActions();paintChanges();showDebug();}
     })();return r.promise;
   }
   async function restore(){if(generation){say('生成期间不能恢复，请先停止生成。');return;}if(run){cancel('取消处理后恢复…');await run.promise;}
     const b=validBackup();if(!b){say('当前最后回复没有可恢复的备份。');return;}
     const r={operation:opOf(modeOf(prefs())),backup:b,identity:last().message,scope:scope(),controller:new host.AbortController()};
-    try{const result=b.processed||(b.expected!==b.source?b.expected:null);if(!result){say('还没有可对比的处理结果。');return;}b.processed=result;const text=b.expected===b.source?result:b.source;await write(r,text);release();say(text===b.source?'当前显示原文；再点一次可查看处理结果。':'当前显示最近处理结果；再点一次可查看原文。');}catch(e){say(e.message);}
+    try{const result=b.processed||(b.expected!==b.source?b.expected:null);if(!result){say('还没有可对比的处理结果。');return;}b.processed=result;const text=b.expected===b.source?result:b.source;await write(r,text);release();paintChanges();say(text===b.source?'当前显示原文；再点一次可查看处理结果。':'当前显示最近处理结果；再点一次可查看原文。');}catch(e){say(e.message);}
   }
   // ---------- 圆形悬浮球 ----------
   // 做法照抄「系统面板」那颗球（44×44、点一下开合、可拖动、位置按比例存全局偏好），
@@ -905,6 +1101,7 @@ color-scheme:light}
     if(name==='debug')showDebug();
   }
   for(const name of folds)el(name).onclick=()=>fold(name);
+  el('changes-fold').onclick=()=>toggleChanges();
   function saveConfig(){
     if(run||testRun)throw Error('请等待请求完成或取消后再修改接口。');
     apiRoot(el('base').value.trim());const tokens=Number(el('tokens').value);
@@ -1046,8 +1243,8 @@ color-scheme:light}
     const item=last();if(!item||(item.id===g.id&&item.message.mes===g.old&&(item.message.swipe_id??0)===g.oldSwipe))return;
     captureLatest();paintActions();debug=null;showDebug();if(enabled)return process(false,'current');
   }
-  function chatChanged(){closeTemplateEditor();if(pendingStart)pendingStart.cancelled=true;cancel('聊天已切换，旧处理不会写入新聊天。');release();generation=null;backup=null;backups=[];debug=null;outgoing=null;records=[];persist();paintCard();showDebug();}
-  function messageChanged(){if(writing)return;if(run&&!matches(run.backup)){cancel('消息已改变，处理结果将丢弃。');release();}if(!generation){validBackup();prune();persist();}paintActions();}
+  function chatChanged(){closeTemplateEditor();if(pendingStart)pendingStart.cancelled=true;cancel('聊天已切换，旧处理不会写入新聊天。');release();generation=null;backup=null;backups=[];debug=null;outgoing=null;records=[];persist();clearChanges('');paintCard();showDebug();}
+  function messageChanged(){if(writing)return;if(run&&!matches(run.backup)){cancel('消息已改变，处理结果将丢弃。');release();}if(!generation){validBackup();prune();persist();}paintActions();paintChanges();}
   function cleanup(){host.removeEventListener?.('click',blockUserSend,true);host.removeEventListener?.('keydown',blockUserSend,true);host.removeEventListener?.('submit',blockUserSend,true);host.removeEventListener?.('resize',fitViewport);host.visualViewport?.removeEventListener('resize',fitViewport);host.visualViewport?.removeEventListener('scroll',fitViewport);disposed=true;cancel('脚本已关闭。');testRun?.abort();release();subs.forEach(s=>s.stop());if(host.fetch===mainFetch)host.fetch=originalFetch;records=[];root.remove();delete host[ID];}
   try{if(typeof ctx().updateMessageBlock!=='function'||typeof ctx().eventSource?.on!=='function'||!ctx().eventTypes.GENERATION_STARTED||!ctx().eventTypes.GENERATION_ENDED||!ctx().eventTypes.GENERATION_AFTER_COMMANDS)throw Error('当前酒馆缺少消息刷新或生成事件接口，插件无法运行。');on('GENERATION_STARTED',before);on('GENERATION_AFTER_COMMANDS',()=>{if(generation?.stopped||pendingStart?.cancelled||pendingStart&&pendingStart.scope!==scope())ctx().stopGeneration();pendingStart=null;});on('GENERATION_ENDED',ended);on('GENERATION_STOPPED',()=>{if(generation)generation.stopped=true;if(pendingStart){pendingStart.cancelled=true;cancel('等待中的生成已停止。');release();}});on('CHAT_CHANGED',chatChanged);on('CHAT_COMPLETION_SETTINGS_READY',ready);host.fetch=mainFetch;for(const e of ['MESSAGE_SWIPED','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_UPDATED'])on(e,messageChanged);say('已就绪。自动处理默认关闭；设置按角色保存。');}catch(e){say(e.message);}
   try{el('protected-tags').value=protectedTagNames(config.protectedTags,config.outerTag).map(n=>'<'+n+'>').join('\n');}catch(_){el('protected-tags').value=config.protectedTags;}
